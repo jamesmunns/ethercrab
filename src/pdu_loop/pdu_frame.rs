@@ -16,7 +16,7 @@ use smoltcp::wire::{EthernetAddress, EthernetFrame};
 
 #[atomic_enum::atomic_enum]
 #[derive(PartialEq, Default)]
-enum FrameState {
+pub(crate) enum FrameState {
     // SAFETY: Because we create a bunch of `Frame`s with `MaybeUninit::zeroed`, the `None` state
     // MUST be equal to zero. All other fields in `Frame` are overridden in `replace`, so there
     // should be no UB there.
@@ -35,31 +35,38 @@ impl Default for AtomicFrameState {
 
 #[derive(Debug, Default)]
 pub(crate) struct Frame {
-    state: AtomicFrameState,
     waker: Option<Waker>,
     pub pdu: Pdu,
 }
 
 impl Frame {
+    pub(crate) const fn new() -> Self {
+        Self {
+            waker: None,
+            pdu: Pdu::new(),
+        }
+    }
+
     pub(crate) fn replace(
         &mut self,
         command: Command,
         data_length: u16,
         index: u8,
     ) -> Result<(), PduError> {
-        let state = self.state.load(Ordering::SeqCst);
+        todo!("ajm")
+        // let state = self.state.load(Ordering::SeqCst);
 
-        if state != FrameState::None {
-            trace!("Expected {:?}, got {:?}", FrameState::None, self.state);
-            return Err(PduError::InvalidFrameState);
-        }
+        // if state != FrameState::None {
+        //     trace!("Expected {:?}, got {:?}", FrameState::None, self.state);
+        //     return Err(PduError::InvalidFrameState);
+        // }
 
-        self.state.store(FrameState::Created, Ordering::SeqCst);
+        // self.state.store(FrameState::Created, Ordering::SeqCst);
 
-        let _ = self.waker.take();
-        self.pdu.replace(command, data_length, index)?;
+        // let _ = self.waker.take();
+        // self.pdu.replace(command, data_length, index)?;
 
-        Ok(())
+        // Ok(())
     }
 
     pub(crate) fn pdu(&self) -> &Pdu {
@@ -100,37 +107,39 @@ impl Frame {
         irq: u16,
         working_counter: u16,
     ) -> Result<(), PduError> {
-        let state = self.state.load(Ordering::SeqCst);
+        todo!("ajm")
+        // let state = self.state.load(Ordering::SeqCst);
 
-        if state != FrameState::Sending {
-            trace!("Expected {:?}, got {:?}", FrameState::Sending, self.state);
-            return Err(PduError::InvalidFrameState);
-        }
+        // if state != FrameState::Sending {
+        //     trace!("Expected {:?}, got {:?}", FrameState::Sending, self.state);
+        //     return Err(PduError::InvalidFrameState);
+        // }
 
-        let waker = self.waker.take().ok_or_else(|| {
-            error!(
-                "Attempted to wake frame #{} with no waker, possibly caused by timeout",
-                self.pdu.index
-            );
+        // let waker = self.waker.take().ok_or_else(|| {
+        //     error!(
+        //         "Attempted to wake frame #{} with no waker, possibly caused by timeout",
+        //         self.pdu.index
+        //     );
 
-            PduError::InvalidFrameState
-        })?;
+        //     PduError::InvalidFrameState
+        // })?;
 
-        self.pdu.set_response(flags, irq, working_counter);
+        // self.pdu.set_response(flags, irq, working_counter);
 
-        self.state.store(FrameState::Done, Ordering::SeqCst);
+        // self.state.store(FrameState::Done, Ordering::SeqCst);
 
-        waker.wake();
+        // waker.wake();
 
-        Ok(())
+        // Ok(())
     }
 
     pub(crate) fn sendable(&mut self) -> Option<SendableFrame<'_>> {
-        if self.state.load(Ordering::SeqCst) == FrameState::Created {
-            Some(SendableFrame { frame: self })
-        } else {
-            None
-        }
+        todo!("ajm")
+        // if self.state.load(Ordering::SeqCst) == FrameState::Created {
+        //     Some(SendableFrame { frame: self })
+        // } else {
+        //     None
+        // }
     }
 }
 
@@ -142,9 +151,10 @@ pub struct SendableFrame<'a> {
 
 impl<'a> SendableFrame<'a> {
     pub(crate) fn mark_sending(&mut self) {
-        self.frame
-            .state
-            .store(FrameState::Sending, Ordering::SeqCst);
+        todo!("ajm")
+        // self.frame
+        //     .state
+        //     .store(FrameState::Sending, Ordering::SeqCst);
     }
 
     pub(crate) fn data_len(&self) -> usize {
@@ -164,28 +174,29 @@ impl Future for Frame {
     type Output = Result<Pdu, Error>;
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = self.state.load(Ordering::SeqCst);
+        todo!("ajm")
+        // let state = self.state.load(Ordering::SeqCst);
 
-        match state {
-            FrameState::None => {
-                trace!("Frame future polled in None state");
-                Poll::Ready(Err(Error::Pdu(PduError::InvalidFrameState)))
-            }
-            FrameState::Created | FrameState::Sending => {
-                // NOTE: Drops previous waker
-                self.waker.replace(ctx.waker().clone());
+        // match state {
+        //     FrameState::None => {
+        //         trace!("Frame future polled in None state");
+        //         Poll::Ready(Err(Error::Pdu(PduError::InvalidFrameState)))
+        //     }
+        //     FrameState::Created | FrameState::Sending => {
+        //         // NOTE: Drops previous waker
+        //         self.waker.replace(ctx.waker().clone());
 
-                Poll::Pending
-            }
-            FrameState::Done => {
-                // Clear frame state ready for reuse
-                self.state.store(FrameState::None, Ordering::SeqCst);
+        //         Poll::Pending
+        //     }
+        //     FrameState::Done => {
+        //         // Clear frame state ready for reuse
+        //         self.state.store(FrameState::None, Ordering::SeqCst);
 
-                // Drop waker so it doesn't get woken again
-                self.waker.take();
+        //         // Drop waker so it doesn't get woken again
+        //         self.waker.take();
 
-                Poll::Ready(Ok(core::mem::take(&mut self.pdu)))
-            }
-        }
+        //         Poll::Ready(Ok(core::mem::take(&mut self.pdu)))
+        //     }
+        // }
     }
 }

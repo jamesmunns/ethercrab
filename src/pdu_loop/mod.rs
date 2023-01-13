@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unused_variables, unused_mut)] // todo
+
 mod frame_header;
 mod pdu;
 pub mod pdu_frame;
@@ -12,7 +14,7 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::NonNull,
+    ptr::{NonNull, addr_of_mut},
     sync::atomic::{AtomicU8, Ordering},
     task::Waker,
 };
@@ -46,14 +48,65 @@ impl<T> CheckWorkingCounter<T> for PduResponse<T> {
     }
 }
 
+struct CreatedFrame<'sto> {
+    fb: FrameBox<'sto>,
+}
+
+struct SendingFrame<'sto> {
+    fb: FrameBox<'sto>,
+}
+
+struct ResponseFrame<'sto> {
+    fb: FrameBox<'sto>,
+}
+
+struct FrameBox<'sto> {
+    fe: NonNull<FrameElement<0>>,
+    buf_len: usize,
+    _lt: PhantomData<&'sto mut FrameElement<0>>,
+}
+
+impl<'sto> FrameBox<'sto> {
+    fn buf_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            let ptr = FrameElement::<0>::buf_ptr(self.fe);
+            core::slice::from_raw_parts_mut(ptr.as_ptr(), self.buf_len)
+        }
+    }
+}
+
+struct FrameElement<const N: usize> {
+    frame: pdu_frame::Frame,
+    status: pdu_frame::FrameState,
+    buffer: [u8; N],
+}
+
+impl<const N: usize> FrameElement<N> {
+    const unsafe fn buf_ptr(this: NonNull<FrameElement<N>>) -> NonNull<u8> {
+        let buf_ptr: *mut [u8; N] = unsafe { addr_of_mut!((*this.as_ptr()).buffer) };
+        let buf_ptr: *mut u8 = buf_ptr.cast();
+        NonNull::new_unchecked(buf_ptr)
+    }
+}
+
+impl<const N: usize> FrameElement<N> {
+    pub const fn new() -> Self {
+        Self {
+            frame: pdu_frame::Frame::new(),
+            status: pdu_frame::FrameState::None,
+            buffer: [0u8; N],
+        }
+    }
+}
+
 unsafe impl Sync for PduLoop {}
 
 /// Stores PDU frames that are currently being prepared to send, in flight, or being received and
 /// processed.
 #[derive(Debug)]
 pub struct PduStorage<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> {
-    frame_data: UnsafeCell<[[u8; MAX_PDU_DATA]; MAX_FRAMES]>,
-    frames: UnsafeCell<[pdu_frame::Frame; MAX_FRAMES]>,
+    // TODO(AJM): We could kill the MU if we can get a const array constructor.
+    inner: UnsafeCell<MaybeUninit<[FrameElement<MAX_PDU_DATA>; MAX_FRAMES]>>,
 }
 
 unsafe impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> Sync
@@ -64,9 +117,6 @@ unsafe impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> Sync
 impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> PduStorage<MAX_FRAMES, MAX_PDU_DATA> {
     /// Create a new `PduStorage` instance.
     pub const fn new() -> Self {
-        // MSRV: Nightly
-        let frames = unsafe { MaybeUninit::zeroed().assume_init() };
-        let frame_data = unsafe { MaybeUninit::zeroed().assume_init() };
 
         // MSRV: Make `MAX_FRAMES` a `u8` when `generic_const_exprs` is stablised
         assert!(
@@ -74,15 +124,18 @@ impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> PduStorage<MAX_FRAMES, 
             "Packet indexes are u8s, so cache array cannot be any bigger than u8::MAX"
         );
 
-        Self { frame_data, frames }
+        let inner: UnsafeCell<MaybeUninit<[FrameElement<MAX_PDU_DATA>; MAX_FRAMES]>> = UnsafeCell::new(MaybeUninit::zeroed());
+
+        Self { inner }
     }
 
     /// Get a reference to this `PduStorage` with erased lifetimes.
     pub const fn as_ref<'a>(&'a self) -> PduStorageRef<'a> {
+        let fptr: *mut MaybeUninit<[FrameElement<MAX_PDU_DATA>; MAX_FRAMES]> = self.inner.get();
+        let fptr: *mut FrameElement<0> = fptr.cast();
         PduStorageRef {
-            frames: NonNull::new(self.frames.get().cast::<pdu_frame::Frame>()).unwrap(),
+            frames: unsafe { NonNull::new_unchecked(fptr) },
             num_frames: MAX_FRAMES,
-            frame_data: NonNull::new(self.frame_data.get().cast::<u8>()).unwrap(),
             frame_data_len: MAX_PDU_DATA,
             _lifetime: PhantomData,
         }
@@ -91,30 +144,38 @@ impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> PduStorage<MAX_FRAMES, 
 
 #[derive(Debug)]
 pub struct PduStorageRef<'a> {
-    frames: NonNull<pdu_frame::Frame>,
+    frames: NonNull<FrameElement<0>>,
     num_frames: usize,
-    frame_data: NonNull<u8>,
     frame_data_len: usize,
     _lifetime: PhantomData<&'a ()>,
 }
 
+pub struct SendableIter<'a, 'b> {
+    storage: &'b PduStorageRef<'a>,
+    idx: usize,
+}
+
 impl<'a> PduStorageRef<'a> {
-    fn frame(&self, idx: u8) -> Result<(&mut pdu_frame::Frame, &mut [u8]), Error> {
-        let idx = usize::from(idx);
+    fn alloc_frame(&self) -> Result<CreatedFrame<'a>, Error> {
+        todo!("
+            Search for an idle frame, if we find one, take it, initialize it,
+            and make a CreatedFrame from it
+        ")
+        // let idx = usize::from(idx);
 
-        if idx > self.num_frames {
-            return Err(Error::Pdu(PduError::InvalidIndex(idx)));
-        }
+        // if idx > self.num_frames {
+        //     return Err(Error::Pdu(PduError::InvalidIndex(idx)));
+        // }
 
-        let frame = unsafe { &mut *self.frames.as_ptr().add(idx) };
-        let data = unsafe {
-            core::slice::from_raw_parts_mut(
-                self.frame_data.as_ptr().add(self.frame_data_len * idx),
-                self.frame_data_len,
-            )
-        };
+        // let frame = unsafe { &mut *self.frames.as_ptr().add(idx) };
+        // let data = unsafe {
+        //     core::slice::from_raw_parts_mut(
+        //         self.frame_data.as_ptr().add(self.frame_data_len * idx),
+        //         self.frame_data_len,
+        //     )
+        // };
 
-        Ok((frame, data))
+        // Ok((frame, data))
     }
 }
 
@@ -161,23 +222,24 @@ impl PduLoop {
     /// The blocking `send` function is called for each ready frame. It is given a `SendableFrame`.
     pub fn send_frames_blocking<F>(&self, waker: &Waker, mut send: F) -> Result<(), Error>
     where
-        F: FnMut(&SendableFrame, &[u8]) -> Result<(), ()>,
+        F: FnMut(&SendableFrame<'_>, &[u8]) -> Result<(), ()>,
     {
-        for idx in 0..(self.storage.num_frames as u8) {
-            let (frame, data) = self.storage.frame(idx)?;
+        todo!("ajm")
+        // for idx in 0..(self.storage.num_frames as u8) {
+        //     let (frame, data) = self.storage.frame(idx)?;
 
-            if let Some(ref mut frame) = frame.sendable() {
-                frame.mark_sending();
+        //     if let Some(ref mut frame) = frame.sendable() {
+        //         frame.mark_sending();
 
-                send(frame, &data[0..frame.data_len()]).map_err(|_| Error::SendFrame)?;
-            }
-        }
+        //         send(frame, &data[0..frame.data_len()]).map_err(|_| Error::SendFrame)?;
+        //     }
+        // }
 
-        if self.tx_waker.read().is_none() {
-            self.tx_waker.write().replace(waker.clone());
-        }
+        // if self.tx_waker.read().is_none() {
+        //     self.tx_waker.write().replace(waker.clone());
+        // }
 
-        Ok(())
+        // Ok(())
     }
 
     // TX
@@ -187,30 +249,29 @@ impl PduLoop {
         command: Command,
         data_length: u16,
     ) -> Result<PduResponse<&'_ [u8]>, Error> {
-        let idx = self.next_index();
+        let mut frame = self.storage.alloc_frame()?;
 
-        let (frame, frame_data) = self.storage.frame(idx)?;
+        todo!("ajm")
+        // // Remove any previous frame's data or other garbage that might be lying around. For
+        // // performance reasons (maybe - need to bench) this only blanks the portion of the buffer
+        // // that will be used.
+        // frame_data[0..usize::from(data_length)].fill(0);
 
-        // Remove any previous frame's data or other garbage that might be lying around. For
-        // performance reasons (maybe - need to bench) this only blanks the portion of the buffer
-        // that will be used.
-        frame_data[0..usize::from(data_length)].fill(0);
+        // frame.replace(command, data_length, idx)?;
 
-        frame.replace(command, data_length, idx)?;
+        // self.wake_sender();
 
-        self.wake_sender();
+        // let res = frame.await?;
 
-        let res = frame.await?;
-
-        Ok((
-            &frame_data[0..usize::from(data_length)],
-            res.working_counter(),
-        ))
+        // Ok((
+        //     &frame_data[0..usize::from(data_length)],
+        //     res.working_counter(),
+        // ))
     }
 
-    fn next_index(&self) -> u8 {
-        self.idx.fetch_add(1, Ordering::AcqRel) % self.storage.num_frames as u8
-    }
+    // fn next_index(&self) -> u8 {
+    //     self.idx.fetch_add(1, Ordering::AcqRel) % self.storage.num_frames as u8
+    // }
 
     /// Tell the packet sender there is data ready to send.
     fn wake_sender(&self) {
@@ -226,32 +287,33 @@ impl PduLoop {
         register: u16,
         payload_length: u16,
     ) -> Result<PduResponse<()>, Error> {
-        let idx = self.next_index();
+        todo!("ajm")
+        // let idx = self.next_index();
 
-        let (frame, frame_data) = self.storage.frame(idx)?;
+        // let (frame, frame_data) = self.storage.frame(idx)?;
 
-        frame.replace(
-            Command::Bwr {
-                address: 0,
-                register,
-            },
-            payload_length,
-            idx,
-        )?;
+        // frame.replace(
+        //     Command::Bwr {
+        //         address: 0,
+        //         register,
+        //     },
+        //     payload_length,
+        //     idx,
+        // )?;
 
-        let payload_length = usize::from(payload_length);
+        // let payload_length = usize::from(payload_length);
 
-        let payload = frame_data
-            .get_mut(0..payload_length)
-            .ok_or(Error::Pdu(PduError::TooLong))?;
+        // let payload = frame_data
+        //     .get_mut(0..payload_length)
+        //     .ok_or(Error::Pdu(PduError::TooLong))?;
 
-        payload.fill(0);
+        // payload.fill(0);
 
-        self.wake_sender();
+        // self.wake_sender();
 
-        let res = frame.await?;
+        // let res = frame.await?;
 
-        Ok(((), res.working_counter()))
+        // Ok(((), res.working_counter()))
     }
 
     // TX
@@ -268,32 +330,33 @@ impl PduLoop {
         send_data: &[u8],
         data_length: u16,
     ) -> Result<PduResponse<&'a [u8]>, Error> {
-        let idx = self.next_index();
+        todo!("ajm")
+        // let idx = self.next_index();
 
-        let send_data_len = send_data.len();
-        let payload_length = u16::try_from(send_data.len())?.max(data_length);
+        // let send_data_len = send_data.len();
+        // let payload_length = u16::try_from(send_data.len())?.max(data_length);
 
-        let (frame, frame_data) = self.storage.frame(idx)?;
+        // let (frame, frame_data) = self.storage.frame(idx)?;
 
-        frame.replace(command, payload_length, idx)?;
+        // frame.replace(command, payload_length, idx)?;
 
-        let payload = frame_data
-            .get_mut(0..usize::from(payload_length))
-            .ok_or(Error::Pdu(PduError::TooLong))?;
+        // let payload = frame_data
+        //     .get_mut(0..usize::from(payload_length))
+        //     .ok_or(Error::Pdu(PduError::TooLong))?;
 
-        let (data, rest) = payload.split_at_mut(send_data_len);
+        // let (data, rest) = payload.split_at_mut(send_data_len);
 
-        data.copy_from_slice(send_data);
-        // If we write fewer bytes than the requested payload length (e.g. write SDO with data
-        // payload section reserved for reply), make sure the remaining data is zeroed out from any
-        // previous request.
-        rest.fill(0);
+        // data.copy_from_slice(send_data);
+        // // If we write fewer bytes than the requested payload length (e.g. write SDO with data
+        // // payload section reserved for reply), make sure the remaining data is zeroed out from any
+        // // previous request.
+        // rest.fill(0);
 
-        self.wake_sender();
+        // self.wake_sender();
 
-        let res = frame.await?;
+        // let res = frame.await?;
 
-        Ok((&payload[0..send_data_len], res.working_counter()))
+        // Ok((&payload[0..send_data_len], res.working_counter()))
     }
 
     // TX
@@ -310,66 +373,68 @@ impl PduLoop {
     // RX
     /// Parse a PDU from a complete Ethernet II frame.
     pub fn pdu_rx(&self, ethernet_frame: &[u8]) -> Result<(), Error> {
-        let raw_packet = EthernetFrame::new_checked(ethernet_frame)?;
+        todo!("ajm")
 
-        // Look for EtherCAT packets whilst ignoring broadcast packets sent from self.
-        // As per <https://github.com/OpenEtherCATsociety/SOEM/issues/585#issuecomment-1013688786>,
-        // the first slave will set the second bit of the MSB of the MAC address. This means if we
-        // send e.g. 10:10:10:10:10:10, we receive 12:10:10:10:10:10 which is useful for this
-        // filtering.
-        if raw_packet.ethertype() != ETHERCAT_ETHERTYPE || raw_packet.src_addr() == MASTER_ADDR {
-            return Ok(());
-        }
+        // let raw_packet = EthernetFrame::new_checked(ethernet_frame)?;
 
-        let i = raw_packet.payload();
+        // // Look for EtherCAT packets whilst ignoring broadcast packets sent from self.
+        // // As per <https://github.com/OpenEtherCATsociety/SOEM/issues/585#issuecomment-1013688786>,
+        // // the first slave will set the second bit of the MSB of the MAC address. This means if we
+        // // send e.g. 10:10:10:10:10:10, we receive 12:10:10:10:10:10 which is useful for this
+        // // filtering.
+        // if raw_packet.ethertype() != ETHERCAT_ETHERTYPE || raw_packet.src_addr() == MASTER_ADDR {
+        //     return Ok(());
+        // }
 
-        let (i, header) = context("header", FrameHeader::parse)(i)?;
+        // let i = raw_packet.payload();
 
-        // Only take as much as the header says we should
-        let (_rest, i) = take(header.payload_len())(i)?;
+        // let (i, header) = context("header", FrameHeader::parse)(i)?;
 
-        let (i, command_code) = map_res(u8, CommandCode::try_from)(i)?;
-        let (i, index) = u8(i)?;
+        // // Only take as much as the header says we should
+        // let (_rest, i) = take(header.payload_len())(i)?;
 
-        let (frame, frame_data) = self.storage.frame(index)?;
+        // let (i, command_code) = map_res(u8, CommandCode::try_from)(i)?;
+        // let (i, index) = u8(i)?;
 
-        if frame.pdu.index != index {
-            return Err(Error::Pdu(PduError::Validation(
-                PduValidationError::IndexMismatch {
-                    sent: frame.pdu.index,
-                    received: index,
-                },
-            )));
-        }
+        // let (frame, frame_data) = self.storage.frame(index)?;
 
-        let (i, command) = command_code.parse_address(i)?;
+        // if frame.pdu.index != index {
+        //     return Err(Error::Pdu(PduError::Validation(
+        //         PduValidationError::IndexMismatch {
+        //             sent: frame.pdu.index,
+        //             received: index,
+        //         },
+        //     )));
+        // }
 
-        // Check for weird bugs where a slave might return a different command than the one sent for
-        // this PDU index.
-        if command.code() != frame.pdu().command().code() {
-            return Err(Error::Pdu(PduError::Validation(
-                PduValidationError::CommandMismatch {
-                    sent: command,
-                    received: frame.pdu().command(),
-                },
-            )));
-        }
+        // let (i, command) = command_code.parse_address(i)?;
 
-        let (i, flags) = map_res(take(2usize), PduFlags::unpack_from_slice)(i)?;
-        let (i, irq) = le_u16(i)?;
-        let (i, data) = take(flags.length)(i)?;
-        let (i, working_counter) = le_u16(i)?;
+        // // Check for weird bugs where a slave might return a different command than the one sent for
+        // // this PDU index.
+        // if command.code() != frame.pdu().command().code() {
+        //     return Err(Error::Pdu(PduError::Validation(
+        //         PduValidationError::CommandMismatch {
+        //             sent: command,
+        //             received: frame.pdu().command(),
+        //         },
+        //     )));
+        // }
 
-        log::trace!("Received frame with index {index:#04x}, WKC {working_counter}");
+        // let (i, flags) = map_res(take(2usize), PduFlags::unpack_from_slice)(i)?;
+        // let (i, irq) = le_u16(i)?;
+        // let (i, data) = take(flags.length)(i)?;
+        // let (i, working_counter) = le_u16(i)?;
 
-        // `_i` should be empty as we `take()`d an exact amount above.
-        debug_assert_eq!(i.len(), 0);
+        // log::trace!("Received frame with index {index:#04x}, WKC {working_counter}");
 
-        frame_data[0..usize::from(flags.len())].copy_from_slice(data);
+        // // `_i` should be empty as we `take()`d an exact amount above.
+        // debug_assert_eq!(i.len(), 0);
 
-        frame.wake_done(flags, irq, working_counter)?;
+        // frame_data[0..usize::from(flags.len())].copy_from_slice(data);
 
-        Ok(())
+        // frame.wake_done(flags, irq, working_counter)?;
+
+        // Ok(())
     }
 }
 

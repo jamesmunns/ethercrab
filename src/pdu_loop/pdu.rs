@@ -16,6 +16,16 @@ pub struct Pdu {
 }
 
 impl Pdu {
+    pub const fn new() -> Self {
+        Self {
+            command: Command::Nop,
+            index: 0,
+            flags: PduFlags::with_len(0),
+            irq: 0,
+            working_counter: 0,
+        }
+    }
+
     pub fn replace(
         &mut self,
         command: Command,
