@@ -7,14 +7,14 @@ pub mod pdu_frame;
 use crate::{
     command::{Command, CommandCode},
     error::{Error, PduError, PduValidationError},
-    pdu_loop::{frame_header::FrameHeader, pdu::PduFlags, pdu_frame::SendableFrame},
+    pdu_loop::{frame_header::FrameHeader, pdu::PduFlags},
     ETHERCAT_ETHERTYPE, MASTER_ADDR,
 };
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{addr_of_mut, NonNull},
+    ptr::{addr_of_mut, NonNull, addr_of},
     sync::atomic::{AtomicU8, Ordering},
     task::Waker,
 };
@@ -54,8 +54,28 @@ struct CreatedFrame<'sto> {
     fb: FrameBox<'sto>,
 }
 
-struct SendingFrame<'sto> {
+pub struct SendableFrame<'sto> {
     fb: FrameBox<'sto>,
+}
+
+impl<'sto> SendableFrame<'sto> {
+    fn frame_and_buf(&self) -> (&Frame, &[u8]) {
+        let buf_ptr = unsafe { addr_of!((*self.fb.fe.as_ptr()).buffer).cast::<u8>() };
+        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, self.fb.buf_len) };
+        let frame = unsafe { &*addr_of!((*self.fb.fe.as_ptr()).frame) };
+        (frame, buf)
+    }
+}
+
+impl<'sto> SendableFrame<'sto> {
+    pub(crate) fn write_ethernet_packet<'buf>(
+        &self,
+        scratch: &'buf mut [u8],
+    ) -> Result<&'buf [u8], PduError> {
+        let (frame, buf) = self.frame_and_buf();
+        let buf = &buf[..frame.pdu.flags.len().into()];
+        frame.to_ethernet_frame(scratch, buf)
+    }
 }
 
 struct ResponseFrame<'sto> {
@@ -91,9 +111,11 @@ impl<const N: usize> FrameElement<N> {
         NonNull::new_unchecked(buf_ptr)
     }
 
-    /// Attempt to clame a frame element as CREATED. Succeeds if the selected
-    /// FrameElement is currently in the NONE state.
-    unsafe fn claim_created(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
+    unsafe fn swap_state(
+        this: NonNull<FrameElement<N>>,
+        from: usize,
+        to: usize,
+    ) -> Option<NonNull<FrameElement<N>>> {
         let fptr = this.as_ptr();
         // Attempt to swap from "None" to "Created". Return None if this fails.
         //
@@ -102,8 +124,8 @@ impl<const N: usize> FrameElement<N> {
         (&*addr_of_mut!((*fptr).status))
             .0
             .compare_exchange(
-                FrameState::NONE,
-                FrameState::CREATED,
+                from,
+                to,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )
@@ -111,6 +133,18 @@ impl<const N: usize> FrameElement<N> {
 
         // If we got here, it's ours.
         Some(this)
+    }
+
+    /// Attempt to clame a frame element as CREATED. Succeeds if the selected
+    /// FrameElement is currently in the NONE state.
+    unsafe fn claim_created(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
+        Self::swap_state(this, FrameState::NONE, FrameState::CREATED)
+    }
+
+    /// Attempt to clame a frame element as CREATED. Succeeds if the selected
+    /// FrameElement is currently in the NONE state.
+    unsafe fn claim_sending(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
+        Self::swap_state(this, FrameState::SENDABLE, FrameState::SENDING)
     }
 }
 
@@ -259,24 +293,29 @@ impl PduLoop {
     /// The blocking `send` function is called for each ready frame. It is given a `SendableFrame`.
     pub fn send_frames_blocking<F>(&self, waker: &Waker, mut send: F) -> Result<(), Error>
     where
-        F: FnMut(&SendableFrame<'_>, &[u8]) -> Result<(), ()>,
+        F: FnMut(&SendableFrame<'_>) -> Result<(), ()>,
     {
-        todo!("ajm")
-        // for idx in 0..(self.storage.num_frames as u8) {
-        //     let (frame, data) = self.storage.frame(idx)?;
 
-        //     if let Some(ref mut frame) = frame.sendable() {
-        //         frame.mark_sending();
+        // Do a linear search to find the first idle frame
+        for idx in 0..self.storage.num_frames {
+            let idx_nn = unsafe { NonNull::new_unchecked(self.storage.frames.as_ptr().add(idx)) };
+            let found = match unsafe { FrameElement::claim_sending(idx_nn) } {
+                Some(nn) => nn,
+                None => continue,
+            };
+            // The frame is initialized, we are free to treat it as a sending type now.
+            let sending = SendableFrame { fb: FrameBox { fe: found, buf_len: self.storage.frame_data_len, _lt: PhantomData }};
 
-        //         send(frame, &data[0..frame.data_len()]).map_err(|_| Error::SendFrame)?;
-        //     }
-        // }
+            send(&sending).map_err(|_| Error::SendFrame)?;
 
-        // if self.tx_waker.read().is_none() {
-        //     self.tx_waker.write().replace(waker.clone());
-        // }
 
-        // Ok(())
+        }
+
+        if self.tx_waker.read().is_none() {
+            self.tx_waker.write().replace(waker.clone());
+        }
+
+        Ok(())
     }
 
     // TX

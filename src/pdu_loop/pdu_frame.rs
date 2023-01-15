@@ -151,42 +151,42 @@ impl Frame {
         // Ok(())
     }
 
-    pub(crate) fn sendable(&mut self) -> Option<SendableFrame<'_>> {
-        todo!("ajm")
-        // if self.state.load(Ordering::SeqCst) == FrameState::Created {
-        //     Some(SendableFrame { frame: self })
-        // } else {
-        //     None
-        // }
-    }
+    // pub(crate) fn sendable(&mut self) -> Option<SendableFrame<'_>> {
+    //     todo!("ajm")
+    //     // if self.state.load(Ordering::SeqCst) == FrameState::Created {
+    //     //     Some(SendableFrame { frame: self })
+    //     // } else {
+    //     //     None
+    //     // }
+    // }
 }
 
 /// A frame that is in a sendable state.
-#[derive(Debug)]
-pub struct SendableFrame<'a> {
-    frame: &'a mut Frame,
-}
+// #[derive(Debug)]
+// pub struct SendableFrame<'a> {
+//     frame: &'a mut Frame,
+// }
 
-impl<'a> SendableFrame<'a> {
-    pub(crate) fn mark_sending(&mut self) {
-        todo!("ajm")
-        // self.frame
-        //     .state
-        //     .store(FrameState::Sending, Ordering::SeqCst);
-    }
+// impl<'a> SendableFrame<'a> {
+//     pub(crate) fn mark_sending(&mut self) {
+//         todo!("ajm")
+//         // self.frame
+//         //     .state
+//         //     .store(FrameState::Sending, Ordering::SeqCst);
+//     }
 
-    pub(crate) fn data_len(&self) -> usize {
-        usize::from(self.frame.pdu.flags.len())
-    }
+//     pub(crate) fn data_len(&self) -> usize {
+//         usize::from(self.frame.pdu.flags.len())
+//     }
 
-    pub(crate) fn write_ethernet_packet<'buf>(
-        &self,
-        buf: &'buf mut [u8],
-        data: &[u8],
-    ) -> Result<&'buf [u8], PduError> {
-        self.frame.to_ethernet_frame(buf, data)
-    }
-}
+//     pub(crate) fn write_ethernet_packet<'buf>(
+//         &self,
+//         buf: &'buf mut [u8],
+//         data: &[u8],
+//     ) -> Result<&'buf [u8], PduError> {
+//         self.frame.to_ethernet_frame(buf, data)
+//     }
+// }
 
 impl Future for Frame {
     type Output = Result<Pdu, Error>;
