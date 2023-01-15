@@ -65,27 +65,34 @@ impl Frame {
         }
     }
 
-    pub(crate) fn replace(
-        &mut self,
-        command: Command,
-        data_length: u16,
-        index: u8,
-    ) -> Result<(), PduError> {
-        todo!("ajm")
-        // let state = self.state.load(Ordering::SeqCst);
-
-        // if state != FrameState::None {
-        //     trace!("Expected {:?}, got {:?}", FrameState::None, self.state);
-        //     return Err(PduError::InvalidFrameState);
-        // }
-
-        // self.state.store(FrameState::Created, Ordering::SeqCst);
-
-        // let _ = self.waker.take();
-        // self.pdu.replace(command, data_length, index)?;
-
-        // Ok(())
+    pub(crate) fn new_with(pdu: Pdu) -> Self {
+        Self {
+            waker: None,
+            pdu,
+        }
     }
+
+    // pub(crate) fn replace(
+    //     &mut self,
+    //     command: Command,
+    //     data_length: u16,
+    //     index: u8,
+    // ) -> Result<(), PduError> {
+    //     todo!("ajm")
+    //     // let state = self.state.load(Ordering::SeqCst);
+
+    //     // if state != FrameState::None {
+    //     //     trace!("Expected {:?}, got {:?}", FrameState::None, self.state);
+    //     //     return Err(PduError::InvalidFrameState);
+    //     // }
+
+    //     // self.state.store(FrameState::Created, Ordering::SeqCst);
+
+    //     // let _ = self.waker.take();
+    //     // self.pdu.replace(command, data_length, index)?;
+
+    //     // Ok(())
+    // }
 
     pub(crate) fn pdu(&self) -> &Pdu {
         &self.pdu
@@ -119,37 +126,37 @@ impl Frame {
         Ok(ethernet_frame.into_inner())
     }
 
-    pub(crate) fn wake_done(
-        &mut self,
-        flags: PduFlags,
-        irq: u16,
-        working_counter: u16,
-    ) -> Result<(), PduError> {
-        todo!("ajm")
-        // let state = self.state.load(Ordering::SeqCst);
+    // pub(crate) fn wake_done(
+    //     &mut self,
+    //     flags: PduFlags,
+    //     irq: u16,
+    //     working_counter: u16,
+    // ) -> Result<(), PduError> {
+    //     todo!("ajm")
+    //     // let state = self.state.load(Ordering::SeqCst);
 
-        // if state != FrameState::Sending {
-        //     trace!("Expected {:?}, got {:?}", FrameState::Sending, self.state);
-        //     return Err(PduError::InvalidFrameState);
-        // }
+    //     // if state != FrameState::Sending {
+    //     //     trace!("Expected {:?}, got {:?}", FrameState::Sending, self.state);
+    //     //     return Err(PduError::InvalidFrameState);
+    //     // }
 
-        // let waker = self.waker.take().ok_or_else(|| {
-        //     error!(
-        //         "Attempted to wake frame #{} with no waker, possibly caused by timeout",
-        //         self.pdu.index
-        //     );
+    //     // let waker = self.waker.take().ok_or_else(|| {
+    //     //     error!(
+    //     //         "Attempted to wake frame #{} with no waker, possibly caused by timeout",
+    //     //         self.pdu.index
+    //     //     );
 
-        //     PduError::InvalidFrameState
-        // })?;
+    //     //     PduError::InvalidFrameState
+    //     // })?;
 
-        // self.pdu.set_response(flags, irq, working_counter);
+    //     // self.pdu.set_response(flags, irq, working_counter);
 
-        // self.state.store(FrameState::Done, Ordering::SeqCst);
+    //     // self.state.store(FrameState::Done, Ordering::SeqCst);
 
-        // waker.wake();
+    //     // waker.wake();
 
-        // Ok(())
-    }
+    //     // Ok(())
+    // }
 
     // pub(crate) fn sendable(&mut self) -> Option<SendableFrame<'_>> {
     //     todo!("ajm")

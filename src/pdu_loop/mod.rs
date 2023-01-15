@@ -12,11 +12,12 @@ use crate::{
 };
 use core::{
     cell::UnsafeCell,
+    future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{addr_of_mut, NonNull, addr_of},
+    ptr::{addr_of, addr_of_mut, NonNull},
     sync::atomic::{AtomicU8, Ordering},
-    task::Waker,
+    task::Waker, ops::Deref,
 };
 use nom::{
     bytes::complete::take,
@@ -28,7 +29,10 @@ use packed_struct::PackedStructSlice;
 use smoltcp::wire::EthernetFrame;
 use spin::RwLock;
 
-use self::pdu_frame::{Frame, FrameState};
+use self::{
+    pdu::Pdu,
+    pdu_frame::{Frame, FrameState},
+};
 
 pub type PduResponse<T> = (T, u16);
 
@@ -50,6 +54,104 @@ impl<T> CheckWorkingCounter<T> for PduResponse<T> {
     }
 }
 
+struct ReceiveFrameFut<'sto> {
+    fb: FrameBox<'sto>,
+}
+
+pub struct ReceivedFrame<'sto> {
+    fb: FrameBox<'sto>,
+}
+
+pub struct RxFrameDataBuf<'sto> {
+    rx_fr: ReceivedFrame<'sto>,
+    data_start: NonNull<u8>,
+    data_end: NonNull<u8>,
+}
+
+impl<'sto> Drop for ReceivedFrame<'sto> {
+    fn drop(&mut self) {
+        unsafe {
+            FrameElement::set_state(self.fb.fe, FrameState::NONE)
+        }
+    }
+}
+
+impl<'sto> Deref for RxFrameDataBuf<'sto> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        let len = self.len();
+        unsafe {
+            core::slice::from_raw_parts(self.data_start.as_ptr(), len)
+        }
+    }
+}
+
+impl<'sto> RxFrameDataBuf<'sto> {
+    pub fn len(&self) -> usize {
+        (self.data_end.as_ptr() as usize) - (self.data_start.as_ptr() as usize)
+    }
+
+    pub fn trim_front(&mut self, ct: usize) {
+        let sz = self.len();
+        if ct > sz {
+            self.data_start = self.data_end;
+        } else {
+            self.data_start = unsafe { NonNull::new_unchecked(self.data_start.as_ptr().add(ct)) };
+        }
+    }
+}
+
+impl<'sto> ReceivedFrame<'sto> {
+    pub(crate) fn frame(&self) -> &Frame {
+        unsafe {
+            self.fb.frame()
+        }
+    }
+
+    pub(crate) fn frame_and_data(&self) -> (&Frame, &[u8]) {
+        let (frame, buf) = unsafe { self.fb.frame_and_buf() };
+        let data = &buf[..frame.pdu.flags.len().into()];
+        (frame, data)
+    }
+
+    fn into_data_buf(self) -> RxFrameDataBuf<'sto> {
+        let len: usize = self.frame().pdu.flags.len().into();
+        debug_assert!(len <= self.fb.buf_len);
+        let sptr = unsafe { FrameElement::buf_ptr(self.fb.fe) };
+        let eptr = unsafe { NonNull::new_unchecked(sptr.as_ptr().add(len)) };
+        RxFrameDataBuf { rx_fr: self, data_start: sptr, data_end: eptr }
+    }
+}
+
+impl<'sto> ReceivedFrame<'sto> {
+    pub fn wkc(self, expected: u16, context: &'static str) -> Result<RxFrameDataBuf<'sto>, Error> {
+        let (frame, data) = self.frame_and_data();
+        let act_wc = frame.pdu.working_counter();
+
+        if act_wc == expected {
+            Ok(self.into_data_buf())
+        } else {
+            Err(Error::WorkingCounter {
+                expected,
+                received: act_wc,
+                context: Some(context),
+            })
+        }
+    }
+}
+
+impl<'sto> Future for ReceiveFrameFut<'sto> {
+    type Output = Result<ReceivedFrame<'sto>, Error>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        todo!()
+    }
+}
+
 struct CreatedFrame<'sto> {
     fb: FrameBox<'sto>,
 }
@@ -58,12 +160,20 @@ pub struct SendableFrame<'sto> {
     fb: FrameBox<'sto>,
 }
 
+impl<'sto> CreatedFrame<'sto> {
+    fn mark_sendable(self) -> ReceiveFrameFut<'sto> {
+        unsafe {
+            FrameElement::set_state(self.fb.fe, FrameState::SENDABLE);
+        }
+        ReceiveFrameFut { fb: self.fb }
+    }
+}
+
 impl<'sto> SendableFrame<'sto> {
     fn frame_and_buf(&self) -> (&Frame, &[u8]) {
-        let buf_ptr = unsafe { addr_of!((*self.fb.fe.as_ptr()).buffer).cast::<u8>() };
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, self.fb.buf_len) };
-        let frame = unsafe { &*addr_of!((*self.fb.fe.as_ptr()).frame) };
-        (frame, buf)
+        unsafe {
+            self.fb.frame_and_buf()
+        }
     }
 }
 
@@ -89,11 +199,27 @@ struct FrameBox<'sto> {
 }
 
 impl<'sto> FrameBox<'sto> {
-    fn buf_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            let ptr = FrameElement::<0>::buf_ptr(self.fe);
-            core::slice::from_raw_parts_mut(ptr.as_ptr(), self.buf_len)
-        }
+    unsafe fn frame(&self) -> &Frame {
+        unsafe { &*addr_of!((*self.fe.as_ptr()).frame) }
+    }
+
+    unsafe fn frame_and_buf(&self) -> (&Frame, &[u8]) {
+        let buf_ptr = unsafe { addr_of!((*self.fe.as_ptr()).buffer).cast::<u8>() };
+        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, self.buf_len) };
+        let frame = unsafe { &*addr_of!((*self.fe.as_ptr()).frame) };
+        (frame, buf)
+    }
+
+    unsafe fn frame_and_buf_mut(&mut self) -> (&mut Frame, &mut [u8]) {
+        let buf_ptr = unsafe { addr_of_mut!((*self.fe.as_ptr()).buffer).cast::<u8>() };
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, self.buf_len) };
+        let frame = unsafe { &mut *addr_of_mut!((*self.fe.as_ptr()).frame) };
+        (frame, buf)
+    }
+
+    unsafe fn buf_mut(&mut self) -> &mut [u8] {
+        let ptr = FrameElement::<0>::buf_ptr(self.fe);
+        core::slice::from_raw_parts_mut(ptr.as_ptr(), self.buf_len)
     }
 }
 
@@ -111,6 +237,19 @@ impl<const N: usize> FrameElement<N> {
         NonNull::new_unchecked(buf_ptr)
     }
 
+    unsafe fn set_state(this: NonNull<FrameElement<N>>, state: usize) {
+        // TODO: not every state?
+
+        let fptr = this.as_ptr();
+        // Attempt to swap from "None" to "Created". Return None if this fails.
+        //
+        // ONLY create a ref to the status, we have no idea if the rest of the
+        // FrameElement is garbage at this point.
+        (&*addr_of_mut!((*fptr).status))
+            .0
+            .store(state, Ordering::Release);
+    }
+
     unsafe fn swap_state(
         this: NonNull<FrameElement<N>>,
         from: usize,
@@ -123,12 +262,7 @@ impl<const N: usize> FrameElement<N> {
         // FrameElement is garbage at this point.
         (&*addr_of_mut!((*fptr).status))
             .0
-            .compare_exchange(
-                from,
-                to,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Relaxed)
             .ok()?;
 
         // If we got here, it's ours.
@@ -215,27 +349,31 @@ pub struct SendableIter<'a, 'b> {
 }
 
 impl<'a> PduStorageRef<'a> {
-    fn alloc_frame(&self) -> Result<CreatedFrame<'a>, Error> {
+    fn alloc_frame(&self, command: Command, data_length: u16) -> Result<CreatedFrame<'a>, Error> {
         let mut found = None;
 
         // Do a linear search to find the first idle frame
         for idx in 0..self.num_frames {
             let idx_nn = unsafe { NonNull::new_unchecked(self.frames.as_ptr().add(idx)) };
             if let Some(nn) = unsafe { FrameElement::claim_created(idx_nn) } {
-                found = Some(nn);
+                found = Some((idx as u8, nn));
                 break;
             }
         }
 
         // Did we find one?
-        let idle = match found {
+        let (idx, idle) = match found {
             Some(nn) => nn,
             None => return Err(Error::StorageFull),
         };
 
         // Now initialize the frame.
         unsafe {
-            addr_of_mut!((*idle.as_ptr()).frame).write(Frame::default());
+            addr_of_mut!((*idle.as_ptr()).frame).write(Frame::new_with(Pdu::new_with(
+                command,
+                data_length,
+                idx,
+            )));
             let buf_ptr = addr_of_mut!((*idle.as_ptr()).buffer);
             buf_ptr.write_bytes(0x00, self.frame_data_len);
         }
@@ -295,7 +433,6 @@ impl PduLoop {
     where
         F: FnMut(&SendableFrame<'_>) -> Result<(), ()>,
     {
-
         // Do a linear search to find the first idle frame
         for idx in 0..self.storage.num_frames {
             let idx_nn = unsafe { NonNull::new_unchecked(self.storage.frames.as_ptr().add(idx)) };
@@ -304,11 +441,15 @@ impl PduLoop {
                 None => continue,
             };
             // The frame is initialized, we are free to treat it as a sending type now.
-            let sending = SendableFrame { fb: FrameBox { fe: found, buf_len: self.storage.frame_data_len, _lt: PhantomData }};
+            let sending = SendableFrame {
+                fb: FrameBox {
+                    fe: found,
+                    buf_len: self.storage.frame_data_len,
+                    _lt: PhantomData,
+                },
+            };
 
             send(&sending).map_err(|_| Error::SendFrame)?;
-
-
         }
 
         if self.tx_waker.read().is_none() {
@@ -324,30 +465,13 @@ impl PduLoop {
         &self,
         command: Command,
         data_length: u16,
-    ) -> Result<PduResponse<&'_ [u8]>, Error> {
-        let mut frame = self.storage.alloc_frame()?;
+    ) -> Result<ReceivedFrame<'static>, Error> {
+        let created_frame = self.storage.alloc_frame(command, data_length)?;
+        let rx_fut = created_frame.mark_sendable();
+        self.wake_sender();
 
-        todo!("ajm")
-        // // Remove any previous frame's data or other garbage that might be lying around. For
-        // // performance reasons (maybe - need to bench) this only blanks the portion of the buffer
-        // // that will be used.
-        // frame_data[0..usize::from(data_length)].fill(0);
-
-        // frame.replace(command, data_length, idx)?;
-
-        // self.wake_sender();
-
-        // let res = frame.await?;
-
-        // Ok((
-        //     &frame_data[0..usize::from(data_length)],
-        //     res.working_counter(),
-        // ))
+        rx_fut.await
     }
-
-    // fn next_index(&self) -> u8 {
-    //     self.idx.fetch_add(1, Ordering::AcqRel) % self.storage.num_frames as u8
-    // }
 
     /// Tell the packet sender there is data ready to send.
     fn wake_sender(&self) {

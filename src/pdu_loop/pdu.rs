@@ -26,20 +26,30 @@ impl Pdu {
         }
     }
 
-    pub fn replace(
-        &mut self,
-        command: Command,
-        data_length: u16,
-        index: u8,
-    ) -> Result<(), PduError> {
-        self.command = command;
-        self.flags = PduFlags::with_len(data_length);
-        self.irq = 0;
-        self.index = index;
-        self.working_counter = 0;
-
-        Ok(())
+    pub fn new_with(command: Command, data_length: u16, index: u8) -> Self {
+        Self {
+            command,
+            index,
+            flags: PduFlags::with_len(data_length),
+            irq: 0,
+            working_counter: 0,
+        }
     }
+
+    // pub fn replace(
+    //     &mut self,
+    //     command: Command,
+    //     data_length: u16,
+    //     index: u8,
+    // ) -> Result<(), PduError> {
+    //     self.command = command;
+    //     self.flags = PduFlags::with_len(data_length);
+    //     self.irq = 0;
+    //     self.index = index;
+    //     self.working_counter = 0;
+
+    //     Ok(())
+    // }
 
     pub fn set_response(&mut self, flags: PduFlags, irq: u16, working_counter: u16) {
         self.flags = flags;

@@ -288,11 +288,13 @@ where
     where
         T: PduRead,
     {
-        let (data, working_counter) = timeout::<TIMEOUT, _, _>(
+        let rx_frame = timeout::<TIMEOUT, _, _>(
             self.timeouts.pdu,
             self.pdu_loop.pdu_tx_readonly(command, T::len()),
         )
         .await?;
+
+        let (frame, data) = rx_frame.frame_and_data();
 
         let res = T::try_from_slice(data).map_err(|e| {
             log::error!(
@@ -305,7 +307,7 @@ where
             PduError::Decode
         })?;
 
-        Ok((res, working_counter))
+        Ok((res, frame.pdu.working_counter()))
     }
 
     async fn write_service<T>(&self, command: Command, value: T) -> Result<PduResponse<T>, Error>
