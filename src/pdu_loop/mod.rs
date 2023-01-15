@@ -15,9 +15,10 @@ use core::{
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
+    ops::Deref,
     ptr::{addr_of, addr_of_mut, NonNull},
     sync::atomic::{AtomicU8, Ordering},
-    task::Waker, ops::Deref,
+    task::{Poll, Waker},
 };
 use nom::{
     bytes::complete::take,
@@ -55,7 +56,7 @@ impl<T> CheckWorkingCounter<T> for PduResponse<T> {
 }
 
 struct ReceiveFrameFut<'sto> {
-    fb: FrameBox<'sto>,
+    fb: Option<FrameBox<'sto>>,
 }
 
 pub struct ReceivedFrame<'sto> {
@@ -70,9 +71,7 @@ pub struct RxFrameDataBuf<'sto> {
 
 impl<'sto> Drop for ReceivedFrame<'sto> {
     fn drop(&mut self) {
-        unsafe {
-            FrameElement::set_state(self.fb.fe, FrameState::NONE)
-        }
+        unsafe { FrameElement::set_state(self.fb.fe, FrameState::NONE) }
     }
 }
 
@@ -81,9 +80,7 @@ impl<'sto> Deref for RxFrameDataBuf<'sto> {
 
     fn deref(&self) -> &Self::Target {
         let len = self.len();
-        unsafe {
-            core::slice::from_raw_parts(self.data_start.as_ptr(), len)
-        }
+        unsafe { core::slice::from_raw_parts(self.data_start.as_ptr(), len) }
     }
 }
 
@@ -104,9 +101,7 @@ impl<'sto> RxFrameDataBuf<'sto> {
 
 impl<'sto> ReceivedFrame<'sto> {
     pub(crate) fn frame(&self) -> &Frame {
-        unsafe {
-            self.fb.frame()
-        }
+        unsafe { self.fb.frame() }
     }
 
     pub(crate) fn frame_and_data(&self) -> (&Frame, &[u8]) {
@@ -120,7 +115,11 @@ impl<'sto> ReceivedFrame<'sto> {
         debug_assert!(len <= self.fb.buf_len);
         let sptr = unsafe { FrameElement::buf_ptr(self.fb.fe) };
         let eptr = unsafe { NonNull::new_unchecked(sptr.as_ptr().add(len)) };
-        RxFrameDataBuf { rx_fr: self, data_start: sptr, data_end: eptr }
+        RxFrameDataBuf {
+            rx_fr: self,
+            data_start: sptr,
+            data_end: eptr,
+        }
     }
 }
 
@@ -145,10 +144,52 @@ impl<'sto> Future for ReceiveFrameFut<'sto> {
     type Output = Result<ReceivedFrame<'sto>, Error>;
 
     fn poll(
-        self: core::pin::Pin<&mut Self>,
+        mut self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        todo!()
+    ) -> Poll<Self::Output> {
+        let rxin = match self.fb.take() {
+            Some(r) => r,
+            None => return Poll::Ready(Err(Error::Internal)),
+        };
+
+        let swappy = unsafe {
+            FrameElement::swap_state(rxin.fe, FrameState::RX_DONE, FrameState::RX_PROCESSING)
+        };
+        let was = match swappy {
+            Ok(fe) => {
+                return Poll::Ready(Ok(ReceivedFrame { fb: rxin }));
+            }
+            Err(e) => e,
+        };
+
+        // These are the states from the time we start sending until the response
+        // is received. If we observe any of these, it's fine, and we should keep
+        // waiting.
+        let okay = &[
+            FrameState::SENDING,
+            FrameState::WAIT_RX,
+            FrameState::RX_BUSY,
+            FrameState::RX_DONE,
+        ];
+
+        if okay.iter().any(|s| s == &was) {
+            // TODO: touching the waker here would be unsound!
+            //
+            // This is because if the sender ever touches this
+            //
+            // let fm = unsafe { rxin.frame_mut() };
+            // if let Some(w) = fm.waker.replace(cx.waker().clone()) {
+            //     w.wake();
+            // }
+            // self.fb = Some(rxin);
+            return Poll::Pending;
+        }
+
+        // any OTHER observed values of `was` indicates that this future has
+        // lived longer than it should have.
+        //
+        // We have had a bad day.
+        Poll::Ready(Err(Error::Internal))
     }
 }
 
@@ -160,24 +201,30 @@ pub struct SendableFrame<'sto> {
     fb: FrameBox<'sto>,
 }
 
+struct ReceivingFrame<'sto> {
+    fb: FrameBox<'sto>,
+}
+
 impl<'sto> CreatedFrame<'sto> {
     fn mark_sendable(self) -> ReceiveFrameFut<'sto> {
         unsafe {
             FrameElement::set_state(self.fb.fe, FrameState::SENDABLE);
         }
-        ReceiveFrameFut { fb: self.fb }
+        ReceiveFrameFut { fb: Some(self.fb) }
     }
 }
 
 impl<'sto> SendableFrame<'sto> {
-    fn frame_and_buf(&self) -> (&Frame, &[u8]) {
+    fn mark_sent(self) {
         unsafe {
-            self.fb.frame_and_buf()
+            FrameElement::set_state(self.fb.fe, FrameState::WAIT_RX);
         }
     }
-}
 
-impl<'sto> SendableFrame<'sto> {
+    fn frame_and_buf(&self) -> (&Frame, &[u8]) {
+        unsafe { self.fb.frame_and_buf() }
+    }
+
     pub(crate) fn write_ethernet_packet<'buf>(
         &self,
         scratch: &'buf mut [u8],
@@ -188,8 +235,41 @@ impl<'sto> SendableFrame<'sto> {
     }
 }
 
-struct ResponseFrame<'sto> {
-    fb: FrameBox<'sto>,
+impl<'sto> ReceivingFrame<'sto> {
+    fn mark_received(
+        mut self,
+        flags: PduFlags,
+        irq: u16,
+        working_counter: u16,
+    ) -> Result<(), Error> {
+        let (frame, buf) = self.frame_and_buf_mut();
+
+        let waker = frame.waker.take().ok_or_else(|| {
+            error!(
+                "Attempted to wake frame #{} with no waker, possibly caused by timeout",
+                frame.pdu.index
+            );
+
+            PduError::InvalidFrameState
+        })?;
+
+        frame.pdu.set_response(flags, irq, working_counter);
+
+        waker.wake();
+
+        unsafe {
+            FrameElement::set_state(self.fb.fe, FrameState::RX_DONE);
+        }
+        Ok(())
+    }
+
+    fn reset_readable(self) {
+        unsafe { FrameElement::set_state(self.fb.fe, FrameState::WAIT_RX) }
+    }
+
+    fn frame_and_buf_mut(&mut self) -> (&mut Frame, &mut [u8]) {
+        unsafe { self.fb.frame_and_buf_mut() }
+    }
 }
 
 struct FrameBox<'sto> {
@@ -201,6 +281,10 @@ struct FrameBox<'sto> {
 impl<'sto> FrameBox<'sto> {
     unsafe fn frame(&self) -> &Frame {
         unsafe { &*addr_of!((*self.fe.as_ptr()).frame) }
+    }
+
+    unsafe fn frame_mut(&self) -> &mut Frame {
+        unsafe { &mut *addr_of_mut!((*self.fe.as_ptr()).frame) }
     }
 
     unsafe fn frame_and_buf(&self) -> (&Frame, &[u8]) {
@@ -254,31 +338,37 @@ impl<const N: usize> FrameElement<N> {
         this: NonNull<FrameElement<N>>,
         from: usize,
         to: usize,
-    ) -> Option<NonNull<FrameElement<N>>> {
+    ) -> Result<NonNull<FrameElement<N>>, usize> {
         let fptr = this.as_ptr();
         // Attempt to swap from "None" to "Created". Return None if this fails.
         //
         // ONLY create a ref to the status, we have no idea if the rest of the
         // FrameElement is garbage at this point.
-        (&*addr_of_mut!((*fptr).status))
-            .0
-            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Relaxed)
-            .ok()?;
+        (&*addr_of_mut!((*fptr).status)).0.compare_exchange(
+            from,
+            to,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )?;
 
         // If we got here, it's ours.
-        Some(this)
+        Ok(this)
     }
 
     /// Attempt to clame a frame element as CREATED. Succeeds if the selected
     /// FrameElement is currently in the NONE state.
     unsafe fn claim_created(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
-        Self::swap_state(this, FrameState::NONE, FrameState::CREATED)
+        Self::swap_state(this, FrameState::NONE, FrameState::CREATED).ok()
     }
 
     /// Attempt to clame a frame element as CREATED. Succeeds if the selected
     /// FrameElement is currently in the NONE state.
     unsafe fn claim_sending(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
-        Self::swap_state(this, FrameState::SENDABLE, FrameState::SENDING)
+        Self::swap_state(this, FrameState::SENDABLE, FrameState::SENDING).ok()
+    }
+
+    unsafe fn claim_receiving(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
+        Self::swap_state(this, FrameState::WAIT_RX, FrameState::RX_BUSY).ok()
     }
 }
 
@@ -343,12 +433,26 @@ pub struct PduStorageRef<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-pub struct SendableIter<'a, 'b> {
-    storage: &'b PduStorageRef<'a>,
-    idx: usize,
-}
-
 impl<'a> PduStorageRef<'a> {
+    fn get_readable(&self, idx: u8) -> Option<ReceivingFrame<'a>> {
+        let idx_usize: usize = idx.into();
+
+        if idx_usize >= self.num_frames {
+            return None;
+        }
+
+        let idx_nn = unsafe { NonNull::new_unchecked(self.frames.as_ptr().add(idx_usize)) };
+        let rx_nn = unsafe { FrameElement::claim_receiving(idx_nn)? };
+
+        Some(ReceivingFrame {
+            fb: FrameBox {
+                fe: rx_nn,
+                buf_len: self.frame_data_len,
+                _lt: PhantomData,
+            },
+        })
+    }
+
     fn alloc_frame(&self, command: Command, data_length: u16) -> Result<CreatedFrame<'a>, Error> {
         let mut found = None;
 
@@ -449,7 +553,14 @@ impl PduLoop {
                 },
             };
 
-            send(&sending).map_err(|_| Error::SendFrame)?;
+            match send(&sending) {
+                Ok(_) => {
+                    sending.mark_sent();
+                }
+                Err(_) => {
+                    return Err(Error::SendFrame);
+                }
+            }
         }
 
         if self.tx_waker.read().is_none() {
@@ -573,68 +684,74 @@ impl PduLoop {
     // RX
     /// Parse a PDU from a complete Ethernet II frame.
     pub fn pdu_rx(&self, ethernet_frame: &[u8]) -> Result<(), Error> {
-        todo!("ajm")
+        let raw_packet = EthernetFrame::new_checked(ethernet_frame)?;
 
-        // let raw_packet = EthernetFrame::new_checked(ethernet_frame)?;
+        // Look for EtherCAT packets whilst ignoring broadcast packets sent from self.
+        // As per <https://github.com/OpenEtherCATsociety/SOEM/issues/585#issuecomment-1013688786>,
+        // the first slave will set the second bit of the MSB of the MAC address. This means if we
+        // send e.g. 10:10:10:10:10:10, we receive 12:10:10:10:10:10 which is useful for this
+        // filtering.
+        if raw_packet.ethertype() != ETHERCAT_ETHERTYPE || raw_packet.src_addr() == MASTER_ADDR {
+            return Ok(());
+        }
 
-        // // Look for EtherCAT packets whilst ignoring broadcast packets sent from self.
-        // // As per <https://github.com/OpenEtherCATsociety/SOEM/issues/585#issuecomment-1013688786>,
-        // // the first slave will set the second bit of the MSB of the MAC address. This means if we
-        // // send e.g. 10:10:10:10:10:10, we receive 12:10:10:10:10:10 which is useful for this
-        // // filtering.
-        // if raw_packet.ethertype() != ETHERCAT_ETHERTYPE || raw_packet.src_addr() == MASTER_ADDR {
-        //     return Ok(());
-        // }
+        let i = raw_packet.payload();
 
-        // let i = raw_packet.payload();
+        let (i, header) = context("header", FrameHeader::parse)(i)?;
 
-        // let (i, header) = context("header", FrameHeader::parse)(i)?;
+        // Only take as much as the header says we should
+        let (_rest, i) = take(header.payload_len())(i)?;
 
-        // // Only take as much as the header says we should
-        // let (_rest, i) = take(header.payload_len())(i)?;
-
-        // let (i, command_code) = map_res(u8, CommandCode::try_from)(i)?;
-        // let (i, index) = u8(i)?;
+        let (i, command_code) = map_res(u8, CommandCode::try_from)(i)?;
+        let (i, index) = u8(i)?;
 
         // let (frame, frame_data) = self.storage.frame(index)?;
 
-        // if frame.pdu.index != index {
-        //     return Err(Error::Pdu(PduError::Validation(
-        //         PduValidationError::IndexMismatch {
-        //             sent: frame.pdu.index,
-        //             received: index,
-        //         },
-        //     )));
-        // }
+        let mut rxin_frame = self
+            .storage
+            .get_readable(index)
+            .expect("todo(ajm) should fix this/data race says what?");
+        let (frame, frame_data) = rxin_frame.frame_and_buf_mut();
 
-        // let (i, command) = command_code.parse_address(i)?;
+        if frame.pdu.index != index {
+            let sent = frame.pdu.index;
+            rxin_frame.reset_readable();
+            return Err(Error::Pdu(PduError::Validation(
+                PduValidationError::IndexMismatch {
+                    sent,
+                    received: index,
+                },
+            )));
+        }
 
-        // // Check for weird bugs where a slave might return a different command than the one sent for
-        // // this PDU index.
-        // if command.code() != frame.pdu().command().code() {
-        //     return Err(Error::Pdu(PduError::Validation(
-        //         PduValidationError::CommandMismatch {
-        //             sent: command,
-        //             received: frame.pdu().command(),
-        //         },
-        //     )));
-        // }
+        let (i, command) = command_code.parse_address(i)?;
 
-        // let (i, flags) = map_res(take(2usize), PduFlags::unpack_from_slice)(i)?;
-        // let (i, irq) = le_u16(i)?;
-        // let (i, data) = take(flags.length)(i)?;
-        // let (i, working_counter) = le_u16(i)?;
+        // Check for weird bugs where a slave might return a different command than the one sent for
+        // this PDU index.
+        if command.code() != frame.pdu().command().code() {
+            let received = frame.pdu().command();
+            rxin_frame.reset_readable();
+            return Err(Error::Pdu(PduError::Validation(
+                PduValidationError::CommandMismatch {
+                    sent: command,
+                    received,
+                },
+            )));
+        }
 
-        // log::trace!("Received frame with index {index:#04x}, WKC {working_counter}");
+        let (i, flags) = map_res(take(2usize), PduFlags::unpack_from_slice)(i)?;
+        let (i, irq) = le_u16(i)?;
+        let (i, data) = take(flags.length)(i)?;
+        let (i, working_counter) = le_u16(i)?;
 
-        // // `_i` should be empty as we `take()`d an exact amount above.
-        // debug_assert_eq!(i.len(), 0);
+        log::trace!("Received frame with index {index:#04x}, WKC {working_counter}");
 
-        // frame_data[0..usize::from(flags.len())].copy_from_slice(data);
+        // `_i` should be empty as we `take()`d an exact amount above.
+        debug_assert_eq!(i.len(), 0);
 
-        // frame.wake_done(flags, irq, working_counter)?;
+        frame_data[0..usize::from(flags.len())].copy_from_slice(data);
 
-        // Ok(())
+        rxin_frame.mark_received(flags, irq, working_counter)
     }
 }
 

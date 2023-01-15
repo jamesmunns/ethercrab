@@ -26,24 +26,20 @@ impl FrameState {
     /// Owner: Whoever owns the SendableFrame. NOT safe to atomically swap.
     pub(crate) const SENDING: usize = 0x03;
     /// ???
-    pub(crate) const DONE: usize = 0x04;
+    pub(crate) const WAIT_RX: usize = 0x04;
+    /// ???
+    pub(crate) const RX_BUSY: usize = 0x04;
+    /// >>>
+    pub(crate) const RX_DONE: usize = 0x06;
+    /// ???
+    pub(crate) const RX_PROCESSING: usize = 0x07;
+    /// ???
+    pub(crate) const DONE: usize = 0x42;
 
     pub const fn const_default() -> Self {
         Self(AtomicUsize::new(Self::NONE))
     }
 }
-
-// pub(crate) enum FrameState {
-//     // SAFETY: Because we create a bunch of `Frame`s with `MaybeUninit::zeroed`, the `None` state
-//     // MUST be equal to zero. All other fields in `Frame` are overridden in `replace`, so there
-//     // should be no UB there.
-//     #[default]
-//     None = 0x00,
-//     Created,
-//     Sendable,
-//     Sending,
-//     Done,
-// }
 
 impl Default for FrameState {
     fn default() -> Self {
@@ -53,7 +49,7 @@ impl Default for FrameState {
 
 #[derive(Debug, Default)]
 pub(crate) struct Frame {
-    waker: Option<Waker>,
+    pub(crate) waker: Option<Waker>,
     pub pdu: Pdu,
 }
 
@@ -71,28 +67,6 @@ impl Frame {
             pdu,
         }
     }
-
-    // pub(crate) fn replace(
-    //     &mut self,
-    //     command: Command,
-    //     data_length: u16,
-    //     index: u8,
-    // ) -> Result<(), PduError> {
-    //     todo!("ajm")
-    //     // let state = self.state.load(Ordering::SeqCst);
-
-    //     // if state != FrameState::None {
-    //     //     trace!("Expected {:?}, got {:?}", FrameState::None, self.state);
-    //     //     return Err(PduError::InvalidFrameState);
-    //     // }
-
-    //     // self.state.store(FrameState::Created, Ordering::SeqCst);
-
-    //     // let _ = self.waker.take();
-    //     // self.pdu.replace(command, data_length, index)?;
-
-    //     // Ok(())
-    // }
 
     pub(crate) fn pdu(&self) -> &Pdu {
         &self.pdu
@@ -125,50 +99,9 @@ impl Frame {
 
         Ok(ethernet_frame.into_inner())
     }
-
-    // pub(crate) fn wake_done(
-    //     &mut self,
-    //     flags: PduFlags,
-    //     irq: u16,
-    //     working_counter: u16,
-    // ) -> Result<(), PduError> {
-    //     todo!("ajm")
-    //     // let state = self.state.load(Ordering::SeqCst);
-
-    //     // if state != FrameState::Sending {
-    //     //     trace!("Expected {:?}, got {:?}", FrameState::Sending, self.state);
-    //     //     return Err(PduError::InvalidFrameState);
-    //     // }
-
-    //     // let waker = self.waker.take().ok_or_else(|| {
-    //     //     error!(
-    //     //         "Attempted to wake frame #{} with no waker, possibly caused by timeout",
-    //     //         self.pdu.index
-    //     //     );
-
-    //     //     PduError::InvalidFrameState
-    //     // })?;
-
-    //     // self.pdu.set_response(flags, irq, working_counter);
-
-    //     // self.state.store(FrameState::Done, Ordering::SeqCst);
-
-    //     // waker.wake();
-
-    //     // Ok(())
-    // }
-
-    // pub(crate) fn sendable(&mut self) -> Option<SendableFrame<'_>> {
-    //     todo!("ajm")
-    //     // if self.state.load(Ordering::SeqCst) == FrameState::Created {
-    //     //     Some(SendableFrame { frame: self })
-    //     // } else {
-    //     //     None
-    //     // }
-    // }
 }
 
-/// A frame that is in a sendable state.
+// /// A frame that is in a sendable state.
 // #[derive(Debug)]
 // pub struct SendableFrame<'a> {
 //     frame: &'a mut Frame,
@@ -195,33 +128,33 @@ impl Frame {
 //     }
 // }
 
-impl Future for Frame {
-    type Output = Result<Pdu, Error>;
+// impl Future for Frame {
+//     type Output = Result<Pdu, Error>;
 
-    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!("ajm")
-        // let state = self.state.load(Ordering::SeqCst);
+//     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+//         todo!("ajm")
+//         // let state = self.state.load(Ordering::SeqCst);
 
-        // match state {
-        //     FrameState::None => {
-        //         trace!("Frame future polled in None state");
-        //         Poll::Ready(Err(Error::Pdu(PduError::InvalidFrameState)))
-        //     }
-        //     FrameState::Created | FrameState::Sending => {
-        //         // NOTE: Drops previous waker
-        //         self.waker.replace(ctx.waker().clone());
+//         // match state {
+//         //     FrameState::None => {
+//         //         trace!("Frame future polled in None state");
+//         //         Poll::Ready(Err(Error::Pdu(PduError::InvalidFrameState)))
+//         //     }
+//         //     FrameState::Created | FrameState::Sending => {
+//         //         // NOTE: Drops previous waker
+//         //         self.waker.replace(ctx.waker().clone());
 
-        //         Poll::Pending
-        //     }
-        //     FrameState::Done => {
-        //         // Clear frame state ready for reuse
-        //         self.state.store(FrameState::None, Ordering::SeqCst);
+//         //         Poll::Pending
+//         //     }
+//         //     FrameState::Done => {
+//         //         // Clear frame state ready for reuse
+//         //         self.state.store(FrameState::None, Ordering::SeqCst);
 
-        //         // Drop waker so it doesn't get woken again
-        //         self.waker.take();
+//         //         // Drop waker so it doesn't get woken again
+//         //         self.waker.take();
 
-        //         Poll::Ready(Ok(core::mem::take(&mut self.pdu)))
-        //     }
-        // }
-    }
-}
+//         //         Poll::Ready(Ok(core::mem::take(&mut self.pdu)))
+//         //     }
+//         // }
+//     }
+// }
