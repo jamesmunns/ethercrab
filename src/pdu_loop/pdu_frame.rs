@@ -9,27 +9,45 @@ use core::{
     future::Future,
     mem,
     pin::Pin,
-    sync::atomic::Ordering,
+    sync::atomic::{Ordering, AtomicUsize},
     task::{Context, Poll, Waker},
 };
 use smoltcp::wire::{EthernetAddress, EthernetFrame};
 
-#[atomic_enum::atomic_enum]
-#[derive(PartialEq, Default)]
-pub(crate) enum FrameState {
-    // SAFETY: Because we create a bunch of `Frame`s with `MaybeUninit::zeroed`, the `None` state
-    // MUST be equal to zero. All other fields in `Frame` are overridden in `replace`, so there
-    // should be no UB there.
-    #[default]
-    None = 0x00,
-    Created,
-    Sending,
-    Done,
+pub(crate) struct FrameState(pub(crate) AtomicUsize);
+
+impl FrameState {
+    /// Owner: PduStorage. Safe to atomically swap to created at any time
+    pub(crate) const NONE: usize = 0x00;
+    /// Owner: Whoever owns the CreatedFrame. NOT safe to atomically swap.
+    pub(crate) const CREATED: usize = 0x01;
+    /// Owner: PduStorage. Safe to atomically swap to sending at any time
+    pub(crate) const SENDABLE: usize = 0x02;
+    /// Owner: Whoever owns the SendableFrame. NOT safe to atomically swap.
+    pub(crate) const SENDING: usize = 0x03;
+    /// ???
+    pub(crate) const DONE: usize = 0x04;
+
+    pub const fn const_default() -> Self {
+        Self(AtomicUsize::new(Self::NONE))
+    }
 }
 
-impl Default for AtomicFrameState {
+// pub(crate) enum FrameState {
+//     // SAFETY: Because we create a bunch of `Frame`s with `MaybeUninit::zeroed`, the `None` state
+//     // MUST be equal to zero. All other fields in `Frame` are overridden in `replace`, so there
+//     // should be no UB there.
+//     #[default]
+//     None = 0x00,
+//     Created,
+//     Sendable,
+//     Sending,
+//     Done,
+// }
+
+impl Default for FrameState {
     fn default() -> Self {
-        Self(Default::default())
+        Self(AtomicUsize::new(Self::NONE))
     }
 }
 

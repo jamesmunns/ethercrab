@@ -14,7 +14,7 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{NonNull, addr_of_mut},
+    ptr::{addr_of_mut, NonNull},
     sync::atomic::{AtomicU8, Ordering},
     task::Waker,
 };
@@ -27,6 +27,8 @@ use nom::{
 use packed_struct::PackedStructSlice;
 use smoltcp::wire::EthernetFrame;
 use spin::RwLock;
+
+use self::pdu_frame::{Frame, FrameState};
 
 pub type PduResponse<T> = (T, u16);
 
@@ -75,9 +77,10 @@ impl<'sto> FrameBox<'sto> {
     }
 }
 
+#[repr(C)]
 struct FrameElement<const N: usize> {
-    frame: pdu_frame::Frame,
-    status: pdu_frame::FrameState,
+    frame: Frame,
+    status: FrameState,
     buffer: [u8; N],
 }
 
@@ -87,13 +90,35 @@ impl<const N: usize> FrameElement<N> {
         let buf_ptr: *mut u8 = buf_ptr.cast();
         NonNull::new_unchecked(buf_ptr)
     }
+
+    /// Attempt to clame a frame element as CREATED. Succeeds if the selected
+    /// FrameElement is currently in the NONE state.
+    unsafe fn claim_created(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
+        let fptr = this.as_ptr();
+        // Attempt to swap from "None" to "Created". Return None if this fails.
+        //
+        // ONLY create a ref to the status, we have no idea if the rest of the
+        // FrameElement is garbage at this point.
+        (&*addr_of_mut!((*fptr).status))
+            .0
+            .compare_exchange(
+                FrameState::NONE,
+                FrameState::CREATED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+
+        // If we got here, it's ours.
+        Some(this)
+    }
 }
 
 impl<const N: usize> FrameElement<N> {
     pub const fn new() -> Self {
         Self {
             frame: pdu_frame::Frame::new(),
-            status: pdu_frame::FrameState::None,
+            status: FrameState::const_default(),
             buffer: [0u8; N],
         }
     }
@@ -117,14 +142,14 @@ unsafe impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> Sync
 impl<const MAX_FRAMES: usize, const MAX_PDU_DATA: usize> PduStorage<MAX_FRAMES, MAX_PDU_DATA> {
     /// Create a new `PduStorage` instance.
     pub const fn new() -> Self {
-
         // MSRV: Make `MAX_FRAMES` a `u8` when `generic_const_exprs` is stablised
         assert!(
             MAX_FRAMES <= u8::MAX as usize,
             "Packet indexes are u8s, so cache array cannot be any bigger than u8::MAX"
         );
 
-        let inner: UnsafeCell<MaybeUninit<[FrameElement<MAX_PDU_DATA>; MAX_FRAMES]>> = UnsafeCell::new(MaybeUninit::zeroed());
+        let inner: UnsafeCell<MaybeUninit<[FrameElement<MAX_PDU_DATA>; MAX_FRAMES]>> =
+            UnsafeCell::new(MaybeUninit::zeroed());
 
         Self { inner }
     }
@@ -157,25 +182,37 @@ pub struct SendableIter<'a, 'b> {
 
 impl<'a> PduStorageRef<'a> {
     fn alloc_frame(&self) -> Result<CreatedFrame<'a>, Error> {
-        todo!("
-            Search for an idle frame, if we find one, take it, initialize it,
-            and make a CreatedFrame from it
-        ")
-        // let idx = usize::from(idx);
+        let mut found = None;
 
-        // if idx > self.num_frames {
-        //     return Err(Error::Pdu(PduError::InvalidIndex(idx)));
-        // }
+        // Do a linear search to find the first idle frame
+        for idx in 0..self.num_frames {
+            let idx_nn = unsafe { NonNull::new_unchecked(self.frames.as_ptr().add(idx)) };
+            if let Some(nn) = unsafe { FrameElement::claim_created(idx_nn) } {
+                found = Some(nn);
+                break;
+            }
+        }
 
-        // let frame = unsafe { &mut *self.frames.as_ptr().add(idx) };
-        // let data = unsafe {
-        //     core::slice::from_raw_parts_mut(
-        //         self.frame_data.as_ptr().add(self.frame_data_len * idx),
-        //         self.frame_data_len,
-        //     )
-        // };
+        // Did we find one?
+        let idle = match found {
+            Some(nn) => nn,
+            None => return Err(Error::StorageFull),
+        };
 
-        // Ok((frame, data))
+        // Now initialize the frame.
+        unsafe {
+            addr_of_mut!((*idle.as_ptr()).frame).write(Frame::default());
+            let buf_ptr = addr_of_mut!((*idle.as_ptr()).buffer);
+            buf_ptr.write_bytes(0x00, self.frame_data_len);
+        }
+
+        Ok(CreatedFrame {
+            fb: FrameBox {
+                fe: idle,
+                buf_len: self.frame_data_len,
+                _lt: PhantomData,
+            },
+        })
     }
 }
 

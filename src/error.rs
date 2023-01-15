@@ -65,6 +65,8 @@ pub enum Error {
     StateTransition,
     /// An unknown slave device was encountered during device discovery/initialisation.
     UnknownSlave,
+    /// Unable to allocate new frame, storage is full
+    StorageFull,
 }
 
 impl From<BorrowError> for Error {
